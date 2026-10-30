@@ -1,0 +1,160 @@
+#!/bin/sh
+# herdr-keep: run a terminal app so Herdr starts it again after a restart.
+#
+#   herdr-keep CMD [ARGS...]      run CMD; after a Herdr restart or a reboot,
+#                                 Herdr runs it again in this pane
+#   herdr-keep aliases            print shell aliases for the apps listed in
+#                                 the plugin's `apps` file
+#   herdr-keep install [--quiet]  link herdr-keep into ~/.local/bin
+#
+# It registers the pane with Herdr as a custom agent whose resume command is
+# `herdr-keep CMD [ARGS...]`. Quitting the app releases the pane again, so
+# only apps that were still running when Herdr went down come back.
+
+set -u
+
+SOURCE="custom:keep"
+HERDR="${HERDR_BIN_PATH:-herdr}"
+PLUGIN_ID="tlpinney.keep"
+
+usage() {
+  sed -n '3,9s/^# \{0,1\}//p' "$0" >&2
+  exit 2
+}
+
+# The plugin config directory, the way Herdr finds it.
+config_dir() {
+  if [ -n "${HERDR_PLUGIN_CONFIG_DIR:-}" ]; then
+    printf '%s\n' "$HERDR_PLUGIN_CONFIG_DIR"
+  else
+    printf '%s/herdr/plugins/config/%s\n' "${XDG_CONFIG_HOME:-$HOME/.config}" "$PLUGIN_ID"
+  fi
+}
+
+# The real path of this script, following symlinks.
+self_path() {
+  path=$0
+  while [ -L "$path" ]; do
+    link=$(readlink "$path")
+    case $link in
+      /*) path=$link ;;
+      *) path=$(dirname "$path")/$link ;;
+    esac
+  done
+  printf '%s/%s\n' "$(cd "$(dirname "$path")" && pwd -P)" "$(basename "$path")"
+}
+
+# Herdr only resumes commands it finds on PATH, so the plugin's startup hook
+# links herdr-keep into ~/.local/bin. It never replaces a file it did not make.
+install_link() {
+  quiet=false
+  [ "${1:-}" = "--quiet" ] && quiet=true
+  self=$(self_path)
+  dir="$HOME/.local/bin"
+  dest="$dir/herdr-keep"
+  mkdir -p "$dir"
+  if [ -L "$dest" ]; then
+    current=$(readlink "$dest")
+    if [ "$current" = "$self" ]; then
+      $quiet || echo "herdr-keep: $dest already links here"
+      return 0
+    fi
+    case $current in
+      */bin/herdr-keep) ;;
+      *)
+        echo "herdr-keep: $dest links to $current, not to this plugin; leaving it" >&2
+        return 1
+        ;;
+    esac
+  elif [ -e "$dest" ]; then
+    echo "herdr-keep: $dest is not a link this plugin made; leaving it" >&2
+    return 1
+  fi
+  ln -sfn "$self" "$dest"
+  $quiet || echo "herdr-keep: linked $dest -> $self"
+  case ":$PATH:" in
+    *":$dir:"*) ;;
+    *) $quiet || echo "herdr-keep: add $dir to PATH, where Herdr looks for resume commands" >&2 ;;
+  esac
+}
+
+# One `alias app='herdr-keep app'` per app in the `apps` file: a command name
+# per line, `#` starts a comment.
+print_aliases() {
+  file="$(config_dir)/apps"
+  [ -f "$file" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    words=${line%%#*}
+    set -f
+    # shellcheck disable=SC2086 # split the line into words, without globbing
+    set -- $words
+    set +f
+    [ $# -gt 0 ] || continue
+    case $# in
+      1) ;;
+      *)
+        echo "# herdr-keep: skipping \"$*\": one command name per line"
+        continue
+        ;;
+    esac
+    case $1 in
+      *[!A-Za-z0-9._+-]*)
+        echo "# herdr-keep: skipping \"$1\": not a plain command name"
+        continue
+        ;;
+    esac
+    printf "alias %s='herdr-keep %s'\n" "$1" "$1"
+  done <"$file"
+}
+
+# Herdr takes a resume command only when no argument holds an apostrophe or a
+# control character.
+resumable() {
+  for arg in "$@"; do
+    case $arg in
+      *"'"*) return 1 ;;
+    esac
+    if [ "$(printf '%s' "$arg" | tr -d '[:cntrl:]')" != "$arg" ]; then
+      return 1
+    fi
+  done
+  return 0
+}
+
+keep() {
+  # Outside Herdr there is nothing to register.
+  [ -n "${HERDR_PANE_ID:-}" ] || exec "$@"
+  if ! command -v "$1" >/dev/null 2>&1; then
+    echo "herdr-keep: $1: command not found" >&2
+    exit 127
+  fi
+  name=$(basename "$1")
+  kept=false
+  if resumable "$@" &&
+    "$HERDR" pane report-agent "$HERDR_PANE_ID" --source "$SOURCE" --agent "$name" \
+      --state unknown -- herdr-keep "$@" >/dev/null 2>&1; then
+    kept=true
+    "$HERDR" pane report-metadata "$HERDR_PANE_ID" --source "$SOURCE" --agent "$name" \
+      --display-agent "$name" --state-label unknown=kept >/dev/null 2>&1
+  fi
+  # Ctrl-C reaches the app; the wrapper only notes it, so it can still release
+  # the pane when the app exits. A handler (not an ignore) resets to the
+  # default in the app.
+  trap ':' INT
+  "$@"
+  status=$?
+  # Herdr stopping takes this process down with the app (SIGHUP) before this
+  # point, which is what keeps the registration for the restart.
+  if $kept; then
+    "$HERDR" pane release-agent "$HERDR_PANE_ID" --source "$SOURCE" --agent "$name" >/dev/null 2>&1
+  fi
+  exit "$status"
+}
+
+case "${1:-}" in
+  "" | -h | --help) usage ;;
+  install) shift; install_link "$@" ;;
+  aliases) print_aliases ;;
+  --) shift; [ $# -gt 0 ] || usage; keep "$@" ;;
+  *) keep "$@" ;;
+esac

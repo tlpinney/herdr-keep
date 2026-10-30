@@ -1,0 +1,10 @@
+id = "tlpinney.keep"
+name = "Keep"
+version = "0.1.0"
+min_herdr_version = "0.9.5"
+description = "Run terminal apps so Herdr starts them again after a restart"
+platforms = ["linux", "macos"]
+
+# Puts herdr-keep on PATH, where Herdr looks for resume commands.
+[[startup]]
+command = ["bin/herdr-keep", "install", "--quiet"]
